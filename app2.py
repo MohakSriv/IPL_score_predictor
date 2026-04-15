@@ -46,7 +46,6 @@ venue = st.sidebar.selectbox("Venue", venues)
 with st.sidebar.expander("🛠️ Customize Playing 12 (Impact Sub)", expanded=False):
     st.caption("Select the specific players to override historical franchise strengths.")
     
-    # Auto-populate the top 12 most frequent batters for the selected team
     t_batters = batters_df[batters_df['battingTeam'] == bat_team]['batterName'].tolist()
     sel_batters = st.multiselect(
         f"{bat_team} Batters", 
@@ -54,7 +53,6 @@ with st.sidebar.expander("🛠️ Customize Playing 12 (Impact Sub)", expanded=F
         default=t_batters[:12] if len(t_batters) >= 12 else t_batters
     )
     
-    # Auto-populate the top 12 most frequent bowlers for the selected team
     t_bowlers = bowlers_df[bowlers_df['bowlingTeam'] == bowl_team]['bowlerName'].tolist()
     sel_bowlers = st.multiselect(
         f"{bowl_team} Bowlers", 
@@ -90,20 +88,17 @@ ball_in_over = min(int(round((overs_bowled - over_int) * 10)), 5)
 legal_ball_num = max(1, min((over_int * 6) + ball_in_over, 119))
 balls_remaining = 120 - legal_ball_num
 
-# ⚡ LINEUP MATH: Override Franchise name with actual Player Bayesian Strengths
 if len(sel_batters) > 0:
     lineup_b = batters_df[batters_df['batterName'].isin(sel_batters)]
-    # Take the top 7 batters by SR to estimate lineup capability
     top7_sr = lineup_b.sort_values('smoothed_sr', ascending=False).head(7)['smoothed_sr'].mean()
-    bat_strength = (top7_sr / 100) * 120 # Convert SR to 120-ball score equivalent
+    bat_strength = (top7_sr / 100) * 120 
 else:
     bat_strength = team_str_df[team_str_df['batting_team'] == bat_team]['batting_strength'].iloc[-1]
 
 if len(sel_bowlers) > 0:
     lineup_bw = bowlers_df[bowlers_df['bowlerName'].isin(sel_bowlers)]
-    # Take the top 6 bowlers by Econ to estimate lineup capability
     top6_econ = lineup_bw.sort_values('smoothed_econ', ascending=True).head(6)['smoothed_econ'].mean()
-    bowl_strength = top6_econ * 20 # Convert Econ to 20-over score equivalent
+    bowl_strength = top6_econ * 20 
 else:
     bowl_strength = team_str_df[team_str_df['bowling_team'] == bowl_team]['bowling_strength'].iloc[-1]
 
@@ -114,33 +109,18 @@ current_rr = (cum_runs / legal_ball_num) * 6 if legal_ball_num > 0 else 0.0
 expected_score = curve[legal_ball_num] if legal_ball_num < len(curve) else curve[-1]
 total_curve_runs = curve[-1]
 
-# Chasing Logic Translation
 is_chasing = 1 if "2nd" in is_chasing_ui else 0
 runs_required = max(0, target_score - cum_runs) if is_chasing else 0
 rrr = (runs_required / max(balls_remaining, 1)) * 6 if is_chasing else 0.0
 
-# Build exact dictionary for the model
 live_features = {
-    'batting_strength': bat_strength, 
-    'bowling_strength': bowl_strength, 
-    'venue_avg_score': venue_avg_score,
-    'cum_runs': cum_runs, 
-    'cum_wickets': cum_wickets, 
-    'balls_remaining': balls_remaining, 
-    'current_rr': current_rr,
-    'wickets_in_hand': 10 - cum_wickets, 
-    'expected_score': expected_score, 
-    'delta_vs_expected': cum_runs - expected_score,
-    'runs_last6': runs_last12 / 2, 
-    'runs_last12': runs_last12, 
-    'wkts_last12': wkts_last12,
-    'dots_last6': dots_last12 // 2, 
-    'boundaries_last6': (runs_last12 / 2) // 4, 
-    'sixes_last6': sixes_last12 // 2,
-    'legal_ball_num': legal_ball_num, 
-    'is_powerplay': 1 if over_int < 6 else 0,
-    'is_middle': 1 if 6 <= over_int < 15 else 0, 
-    'is_death': 1 if over_int >= 15 else 0,
+    'batting_strength': bat_strength, 'bowling_strength': bowl_strength, 'venue_avg_score': venue_avg_score,
+    'cum_runs': cum_runs, 'cum_wickets': cum_wickets, 'balls_remaining': balls_remaining, 'current_rr': current_rr,
+    'wickets_in_hand': 10 - cum_wickets, 'expected_score': expected_score, 'delta_vs_expected': cum_runs - expected_score,
+    'runs_last6': runs_last12 / 2, 'runs_last12': runs_last12, 'wkts_last12': wkts_last12,
+    'dots_last6': dots_last12 // 2, 'boundaries_last6': (runs_last12 / 2) // 4, 'sixes_last6': sixes_last12 // 2,
+    'legal_ball_num': legal_ball_num, 'is_powerplay': 1 if over_int < 6 else 0,
+    'is_middle': 1 if 6 <= over_int < 15 else 0, 'is_death': 1 if over_int >= 15 else 0,
     'balls_in_phase': legal_ball_num if over_int < 6 else (legal_ball_num - 36 if over_int < 15 else legal_ball_num - 90),
     'wickets_per10': (cum_wickets / legal_ball_num) * 10 if legal_ball_num > 0 else 0,
     'rr_acceleration': runs_last12 / (max(current_rr, 0.01) * 2) if current_rr > 0 else 0,
@@ -149,9 +129,7 @@ live_features = {
     'expected_12ov': venue_avg_score * (curve[71] / total_curve_runs),
     'expected_15ov': venue_avg_score * (curve[89] / total_curve_runs),
     'expected_20ov': venue_avg_score,
-    'is_chasing': is_chasing, 
-    'runs_required': runs_required, 
-    'rrr': rrr
+    'is_chasing': is_chasing, 'runs_required': runs_required, 'rrr': rrr
 }
 
 # --- 6. PREDICTION ---
@@ -173,14 +151,16 @@ predicted_final = int(round(cum_runs + mean_rem))
 ci_low  = int(round(cum_runs + max(0, mean_rem - 1.28 * std_rem)))
 ci_high = int(round(cum_runs + mean_rem + 1.28 * std_rem))
 
-# Calculate milestone blending for UI
 def get_blended_milestone(target_ball):
     if legal_ball_num >= target_ball: return None
     curve_diff = (curve[target_ball] - curve[legal_ball_num]) * (venue_avg_score / total_curve_runs)
     crr_diff = (current_rr / 6) * (target_ball - legal_ball_num)
     return int(round(cum_runs + (0.5 * curve_diff) + (0.5 * crr_diff)))
 
-proj_10, proj_15 = get_blended_milestone(59), get_blended_milestone(89)
+proj_6 = get_blended_milestone(35)
+proj_10 = get_blended_milestone(59)
+proj_12 = get_blended_milestone(71)
+proj_15 = get_blended_milestone(89)
 
 # --- 7. UI RENDER ---
 st.title("⚡ IPL Live Score Predictor")
@@ -199,22 +179,42 @@ if is_chasing:
 else:
     c3.metric("Projected Total", f"{predicted_final}", f"± {int(round(1.28 * std_rem))} runs", delta_color="off")
 
+# --- RESTORED MILESTONE CARDS ---
+st.markdown("### 📊 Live Milestones vs Par")
+m1, m2, m3, m4, m5 = st.columns(5)
+
+def display_milestone(col, title, proj, exp):
+    if proj is None:
+        col.metric(title, "Passed")
+    else:
+        delta = proj - exp
+        col.metric(title, f"{proj}", f"{delta:+.0f} vs Par", delta_color="normal")
+
+display_milestone(m1, "6 Overs", proj_6, live_features['expected_6ov'])
+display_milestone(m2, "10 Overs", proj_10, live_features['expected_10ov'])
+display_milestone(m3, "12 Overs", proj_12, live_features['expected_12ov'])
+display_milestone(m4, "15 Overs", proj_15, live_features['expected_15ov'])
+display_milestone(m5, "20 Overs (Model)", predicted_final, venue_avg_score)
+
+st.markdown("---")
+
+# --- CHART RENDERING ---
 st.markdown("### 📈 Innings Progression & Projection")
 fig = go.Figure()
 
-# Plot Par Pace (Gray Dash)
 scaled_curve = [c * (venue_avg_score / total_curve_runs) for c in curve]
 fig.add_trace(go.Scatter(x=[i/6 for i in range(120)], y=scaled_curve, mode='lines', name='Par Pace', line=dict(color='gray', dash='dash')))
 
-# Plot Projection Path
-path_balls = [0, legal_ball_num] + [b for b, s in zip([59, 89], [proj_10, proj_15]) if s is not None] + [119]
-path_scores = [0, cum_runs] + [s for s in [proj_10, proj_15] if s is not None] + [predicted_final]
+# Plot all 4 milestones on the graph
+milestone_balls = [35, 59, 71, 89]
+milestone_scores = [proj_6, proj_10, proj_12, proj_15]
+
+path_balls = [0, legal_ball_num] + [b for b, s in zip(milestone_balls, milestone_scores) if s is not None] + [119]
+path_scores = [0, cum_runs] + [s for s in milestone_scores if s is not None] + [predicted_final]
 fig.add_trace(go.Scatter(x=[b/6 for b in path_balls], y=path_scores, mode='lines+markers', name='Projected Path', line=dict(color='#38BDF8', width=3)))
 
-# Plot "Now" Marker
 fig.add_trace(go.Scatter(x=[legal_ball_num/6], y=[cum_runs], mode='markers+text', name='Now', text=['Now'], textposition='top left', marker=dict(color='#ef4444', size=14, symbol='star')))
 
-# Plot Target Line if Chasing
 if is_chasing:
     fig.add_hline(y=target_score, line_dash="dot", line_color="red", annotation_text="Target", annotation_position="top left")
 
