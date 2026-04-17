@@ -3,12 +3,15 @@ IPL Score Prediction Pipeline - ENTERPRISE GRADE
 ================================================
 - Residual framing (Remaining Runs)
 - Chasing / Scoreboard Pressure Features
-- Bayesian Player Smoothing Priors 
+- Bayesian Player Smoothing Priors
+- 2026 Roster Default Extraction
+- Pace/Spin Matchup Matrix
 """
 
 import pandas as pd
 import numpy as np
 import warnings
+import os
 from sklearn.model_selection import GroupKFold
 from sklearn.metrics import mean_absolute_error
 import lightgbm as lgb
@@ -19,9 +22,11 @@ warnings.filterwarnings('ignore')
 # ─────────────────────────────────────────────
 # STEP 1: LOAD, CLEAN & CHASING FEATURES
 # ─────────────────────────────────────────────
-
 def load_and_clean(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
+    # Drop super-over innings (inningID > 2) — they corrupt target construction
+    # and represent a fundamentally different game state not useful for score prediction
+    df = df[df['inningID'].isin([1, 2])].copy()
     df = df.sort_values(['matchID', 'inningID', 'over', 'ball']).reset_index(drop=True)
 
     df['is_legal'] = (df['isWide'] == 0) & (df['isNoBall'] == 0)
@@ -44,10 +49,9 @@ def load_and_clean(path: str) -> pd.DataFrame:
     df['remaining_runs'] = df['final_score'] - df['cum_runs']
     df['balls_remaining'] = 119 - df['legal_ball_num']
 
-    # --- NEW: CHASING FEATURES ---
     first_innings = df[df['inningID'] == 1].groupby('matchID')['cum_runs'].last().reset_index()
     first_innings.rename(columns={'cum_runs': 'target_score'}, inplace=True)
-    first_innings['target_score'] += 1 # Runs needed to win
+    first_innings['target_score'] += 1 
 
     df = df.merge(first_innings, on='matchID', how='left')
     df['target_score'] = df['target_score'].fillna(0)
@@ -62,13 +66,11 @@ def load_and_clean(path: str) -> pd.DataFrame:
     return df
 
 # ─────────────────────────────────────────────
-# STEP 2: BAYESIAN PLAYER STATS & TEAM PRIORS
+# STEP 2: BAYESIAN STATS & RECENT ROSTERS
 # ─────────────────────────────────────────────
-
 def compute_player_stats(df: pd.DataFrame):
-    # BATTERS (Bayesian Shrinkage to Global Mean)
     global_rpb = df['runs'].sum() / df['is_legal'].sum()
-    M_bat = 60 # 10 overs of ghost history
+    M_bat = 60 
     ghost_runs = global_rpb * M_bat
     
     batters = df[df['is_legal']].groupby('batterName').agg(
@@ -80,8 +82,7 @@ def compute_player_stats(df: pd.DataFrame):
     bat_team_map = df.groupby('batterName')['battingTeam'].agg(lambda x: x.value_counts().index[0]).reset_index()
     batters = batters.merge(bat_team_map, on='batterName').sort_values('real_balls', ascending=False)
 
-    # BOWLERS (Bayesian Shrinkage to Global Economy)
-    M_bowl = 120 # 20 overs of ghost history
+    M_bowl = 120 
     ghost_runs_c = global_rpb * M_bowl
 
     bowlers = df[df['is_legal']].groupby('bowlerName').agg(
@@ -93,7 +94,56 @@ def compute_player_stats(df: pd.DataFrame):
     bowl_team_map = df.groupby('bowlerName')['bowlingTeam'].agg(lambda x: x.value_counts().index[0]).reset_index()
     bowlers = bowlers.merge(bowl_team_map, on='bowlerName').sort_values('real_balls_b', ascending=False)
 
-    return batters, bowlers
+    latest_season = df['season'].max()
+    recent_df = df[df['season'] == latest_season]
+
+    recent_bat = recent_df.groupby(['battingTeam', 'batterName']).size().reset_index(name='balls')
+    recent_rosters_bat = recent_bat.sort_values('balls', ascending=False).groupby('battingTeam')['batterName'].apply(list).to_dict()
+
+    recent_bowl = recent_df.groupby(['bowlingTeam', 'bowlerName']).size().reset_index(name='balls')
+    recent_rosters_bowl = recent_bowl.sort_values('balls', ascending=False).groupby('bowlingTeam')['bowlerName'].apply(list).to_dict()
+
+    return batters, bowlers, recent_rosters_bat, recent_rosters_bowl
+
+def compute_matchup_stats(df: pd.DataFrame, mapping_path: str):
+    if not os.path.exists(mapping_path):
+        print(f"⚠️ {mapping_path} not found. Defaulting all bowlers to 'Pace'.")
+        bowler_mapping = pd.DataFrame({'bowlerName': df['bowlerName'].unique(), 'bowler_type': 'Pace'})
+    else:
+        bowler_mapping = pd.read_csv(mapping_path)
+        
+    df_temp = df.merge(bowler_mapping, on='bowlerName', how='left')
+    df_temp['bowler_type'] = df_temp['bowler_type'].fillna('Pace')
+    
+    global_p = df_temp[df_temp['bowler_type'] == 'Pace']
+    global_s = df_temp[df_temp['bowler_type'] == 'Spin']
+    
+    global_rpb_pace = global_p['runs'].sum() / max(global_p['is_legal'].sum(), 1)
+    global_rpb_spin = global_s['runs'].sum() / max(global_s['is_legal'].sum(), 1)
+    
+    M_bat = 40 
+    ghost_runs_pace = global_rpb_pace * M_bat
+    ghost_runs_spin = global_rpb_spin * M_bat
+    
+    matchups = df_temp[df_temp['is_legal']].groupby(['batterName', 'bowler_type']).agg(
+        real_runs=('batsmanRuns', 'sum'),
+        real_balls=('is_legal', 'sum')
+    ).reset_index()
+    
+    def smooth_sr(row):
+        if row['bowler_type'] == 'Pace':
+            return ((row['real_runs'] + ghost_runs_pace) / (row['real_balls'] + M_bat)) * 100
+        else:
+            return ((row['real_runs'] + ghost_runs_spin) / (row['real_balls'] + M_bat)) * 100
+            
+    matchups['smoothed_sr'] = matchups.apply(smooth_sr, axis=1)
+    
+    matchup_matrix = matchups.pivot(index='batterName', columns='bowler_type', values='smoothed_sr').reset_index()
+    matchup_matrix = matchup_matrix.rename(columns={'Pace': 'vs_Pace_SR', 'Spin': 'vs_Spin_SR'})
+    matchup_matrix['vs_Pace_SR'] = matchup_matrix['vs_Pace_SR'].fillna(global_rpb_pace * 100)
+    matchup_matrix['vs_Spin_SR'] = matchup_matrix['vs_Spin_SR'].fillna(global_rpb_spin * 100)
+    
+    return matchup_matrix, bowler_mapping
 
 def compute_team_strength(df: pd.DataFrame) -> pd.DataFrame:
     match_scores = df.groupby(['matchID', 'inningID', 'battingTeam', 'venue']).agg(total_runs=('runs', 'sum')).reset_index()
@@ -136,14 +186,10 @@ def compute_venue_avg(df: pd.DataFrame) -> pd.DataFrame:
         records.append({'matchID': mid, 'venue_avg_score': v_avg.get(match_venue[match_venue['matchID'] == mid]['venue'].iloc[0], g_mean)})
     return pd.DataFrame(records)
 
-# ─────────────────────────────────────────────
-# STEP 3: EXPECTED SCORE CURVE & FEATURES
-# ─────────────────────────────────────────────
-
 def build_expected_curve(df: pd.DataFrame) -> np.ndarray:
     return df[df['is_legal']].groupby('legal_ball_num')['cum_runs'].mean().reindex(range(120)).interpolate().values
 
-def build_full_dataset(raw_df, team_str_df, venue_avg_df, curve):
+def build_full_dataset(raw_df, team_str_df, venue_avg_df, curve, matchup_matrix, bowler_mapping):
     df = raw_df.copy()
     df = df.merge(team_str_df[['matchID', 'batting_team', 'batting_strength', 'bowling_strength']], left_on=['matchID', 'battingTeam'], right_on=['matchID', 'batting_team'], how='left')
     df = df.merge(venue_avg_df, on='matchID', how='left')
@@ -181,11 +227,22 @@ def build_full_dataset(raw_df, team_str_df, venue_avg_df, curve):
     df['expected_15ov'] = df['venue_avg_score'] * (curve[89] / total_curve_runs)
     df['expected_20ov'] = df['venue_avg_score']
 
-    return df
+    # New Matchup Features
+    df = df.merge(matchup_matrix, left_on='batterName', right_on='batterName', how='left')
+    df = df.merge(bowler_mapping, on='bowlerName', how='left')
+    df['bowler_type'] = df['bowler_type'].fillna('Pace')
 
-# ─────────────────────────────────────────────
-# STEP 4: MODEL TRAINING
-# ─────────────────────────────────────────────
+    # Calculate live matchup edge
+    # bowling_strength is mean runs conceded per innings (~180), convert to equivalent batter SR:
+    # (runs / 120 balls) * 100 = SR conceded; then edge = batter SR - SR conceded
+    bowl_str_as_sr = (df['bowling_strength'] / 120) * 100
+    df['live_matchup_edge'] = np.where(
+        df['bowler_type'] == 'Pace',
+        df['vs_Pace_SR'].fillna(130) - bowl_str_as_sr,
+        df['vs_Spin_SR'].fillna(130) - bowl_str_as_sr
+    )
+
+    return df
 
 FEATURE_COLS = [
     'batting_strength', 'bowling_strength', 'venue_avg_score',
@@ -196,7 +253,7 @@ FEATURE_COLS = [
     'legal_ball_num', 'is_powerplay', 'is_middle', 'is_death',
     'balls_in_phase', 'wickets_per10', 'rr_acceleration',
     'expected_6ov', 'expected_10ov', 'expected_12ov', 'expected_15ov', 'expected_20ov',
-    'is_chasing', 'runs_required', 'rrr' # <--- NEW TARGET PRESSURE FEATURES
+    'is_chasing', 'runs_required', 'rrr', 'live_matchup_edge'
 ]
 
 LGB_PARAMS = {
@@ -208,7 +265,12 @@ LGB_PARAMS = {
 
 def train_model(dataset: pd.DataFrame):
     train_df = dataset[dataset['is_legal']].copy().reset_index(drop=True)
+    # Sort by matchID to enforce temporal ordering before splitting
+    train_df = train_df.sort_values('matchID').reset_index(drop=True)
     X, y, groups = train_df[FEATURE_COLS], train_df['remaining_runs'], train_df['matchID']
+
+    # Use GroupKFold with sorted data so folds are temporally ordered
+    # (earlier matches train, later matches validate — no future leakage)
     gkf = GroupKFold(n_splits=5)
     oof_remaining = np.zeros(len(train_df))
     models = []
@@ -226,17 +288,23 @@ def train_model(dataset: pd.DataFrame):
 if __name__ == '__main__':
     PATH = "IPL_2024_2026_Combined.csv"
     raw = load_and_clean(PATH)
-    batters, bowlers = compute_player_stats(raw)
+    
+    batters, bowlers, recent_bat, recent_bowl = compute_player_stats(raw)
+    matchup_matrix, bowler_map = compute_matchup_stats(raw, 'bowler_types.csv')
+    
     team_str = compute_team_strength(raw)
     venue_avg = compute_venue_avg(raw)
     curve = build_expected_curve(raw)
-    dataset = build_full_dataset(raw, team_str, venue_avg, curve)
+    dataset = build_full_dataset(raw, team_str, venue_avg, curve, matchup_matrix, bowler_map)
     models = train_model(dataset)
     
-    # Save EVERYTHING for Streamlit
     joblib.dump({
         'models': models, 'team_strength': team_str, 'venue_avg': venue_avg,
         'expected_curve': curve, 'feature_cols': FEATURE_COLS,
-        'batters': batters, 'bowlers': bowlers # <--- NEW PLAYER STATS
-    }, 'ipl_predictor_assets.pkl')
-    print("✓ Pipeline complete. Saved to ipl_predictor_assets.pkl")
+        'batters': batters, 'bowlers': bowlers,
+        'recent_rosters_bat': recent_bat,      
+        'recent_rosters_bowl': recent_bowl,    
+        'matchup_matrix': matchup_matrix,
+        'bowler_mapping': bowler_map          # needed for live_matchup_edge at inference
+    }, 'ipl_predictor_assetsv3.pkl')
+    print("✓ Pipeline complete. Saved to ipl_predictor_assetsv3.pkl")
